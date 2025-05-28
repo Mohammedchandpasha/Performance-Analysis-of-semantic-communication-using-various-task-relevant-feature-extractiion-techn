@@ -1,0 +1,102 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+
+# 1. Load MNIST dataset
+mnist = fetch_openml('mnist_784', version=1, as_frame=False)
+X, y = mnist.data / 255.0, mnist.target.astype(int)
+X = X[:10000]
+y = y[:10000]
+
+# 2. Train Autoencoder for 64D bottleneck
+encoding_dim = 64
+input_img = Input(shape=(784,))
+encoded = Dense(128, activation='relu')(input_img)
+encoded = Dense(encoding_dim, activation='relu')(encoded)
+decoded = Dense(128, activation='relu')(encoded)
+decoded = Dense(784, activation='sigmoid')(decoded)
+autoencoder = Model(input_img, decoded)
+encoder = Model(input_img, encoded)
+
+autoencoder.compile(optimizer=Adam(), loss='mse')
+autoencoder.fit(X, X, epochs=10, batch_size=256, shuffle=True, verbose=0)
+
+Z_auto = encoder.predict(X)
+
+# 3. MIMO Channel
+def mimo_channel(Z, n_tx, n_rx):
+    if Z.shape[1] < n_tx:
+        Z = np.hstack((Z, np.zeros((Z.shape[0], n_tx - Z.shape[1]))))
+    else:
+        Z = Z[:, :n_tx]
+    H = (np.random.randn(n_rx, n_tx) + 1j * np.random.randn(n_rx, n_tx)) / np.sqrt(2)
+    U, S, Vh = np.linalg.svd(H)
+    X_precoded = Z @ Vh.conj().T
+    Y_clean = X_precoded @ H.T
+    return Y_clean, U, S, Vh
+
+# 4. SNR setup
+snr_db_train_range = [0, 5, 10, 15, 20, 25, 30]
+snr_db_test_range = [0, 5, 10, 15, 20, 25, 30]
+antenna_config = (64, 64)
+
+accuracies = {train_snr: [] for train_snr in snr_db_train_range}
+
+for train_snr_db in snr_db_train_range:
+    print(f"\nTraining at {train_snr_db} dB...")
+    n_tx, n_rx = antenna_config
+    Y_clean, U, S, Vh = mimo_channel(Z_auto, n_tx, n_rx)
+
+    signal_power = np.mean(np.abs(Y_clean)**2)
+    snr_linear_train = 10 ** (train_snr_db / 10)
+    noise_power_train = signal_power / snr_linear_train
+    noise_train = (np.random.randn(*Y_clean.shape) + 1j * np.random.randn(*Y_clean.shape)) * np.sqrt(noise_power_train / 2)
+    Y_train_noisy = Y_clean + noise_train
+
+    S_inv = np.diag(1 / S)
+    r = len(S)
+    Z_train_recovered = (S_inv @ U[:, :r].conj().T @ Y_train_noisy.T).T.real
+
+    X_train, _, y_train, _ = train_test_split(Z_train_recovered, y, test_size=0.2, random_state=42)
+    y_train_cat = to_categorical(y_train, num_classes=10)
+
+    clf = Sequential([
+        Dense(64, activation='relu', input_shape=(Z_train_recovered.shape[1],)),
+        Dense(10, activation='softmax')
+    ])
+    clf.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
+    clf.fit(X_train, y_train_cat, epochs=10, batch_size=128, verbose=0)
+
+    for test_snr_db in snr_db_test_range:
+        snr_linear_test = 10 ** (test_snr_db / 10)
+        noise_power_test = signal_power / snr_linear_test
+        noise_test = (np.random.randn(*Y_clean.shape) + 1j * np.random.randn(*Y_clean.shape)) * np.sqrt(noise_power_test / 2)
+        Y_test_noisy = Y_clean + noise_test
+
+        Z_test_recovered = (S_inv @ U[:, :r].conj().T @ Y_test_noisy.T).T.real
+        X_test, _, y_test, _ = train_test_split(Z_test_recovered, y, test_size=0.2, random_state=42)
+        y_pred = np.argmax(clf.predict(X_test, verbose=0), axis=1)
+        acc = accuracy_score(y_test, y_pred)
+        accuracies[train_snr_db].append(acc * 100)
+        print(f"    Test SNR {test_snr_db} dB → Accuracy: {acc * 100:.2f}%")
+
+# 5. Plotting
+plt.figure(figsize=(10, 6))
+for train_snr_db in snr_db_train_range:
+    plt.plot(snr_db_test_range, accuracies[train_snr_db], marker='o', label=f'Train SNR = {train_snr_db} dB')
+
+plt.title('Accuracy vs Test SNR using Autoencoder and SVD', fontsize=14)
+plt.xlabel('Test SNR (dB)', fontsize=12)
+plt.ylabel('Classification Accuracy (%)', fontsize=12)
+plt.yticks(np.arange(0, 110, 10))
+plt.ylim(0, 100)
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
